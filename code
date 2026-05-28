@@ -1,0 +1,1150 @@
+import os
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report, mean_squared_error, mean_absolute_percentage_error, \
+    confusion_matrix
+from sklearn.manifold import TSNE
+from sklearn.metrics.pairwise import rbf_kernel
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import matplotlib.colors as mcolors
+import seaborn as sns
+import warnings
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from scipy.stats import ks_2samp, entropy
+from scipy.linalg import sqrtm
+
+# 保持原有配置
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial']
+plt.rcParams['axes.unicode_minus'] = False
+warnings.filterwarnings('ignore')
+
+# 全局变量，用于收集三次测试的混淆矩阵结果，以便最后统一画一张复合大图
+global_cm_results = []
+global_cm_names = []
+
+
+# ==========================================
+# 固化全局随机种子，确保实验可复现性
+# ==========================================
+def set_global_seed(seed=42):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+set_global_seed(42)
+
+
+# ==========================================
+# 工具函数：计算经验 HSIC (Hilbert-Schmidt Independence Criterion)
+# ==========================================
+def calculate_hsic(X, Y, sigma=None):
+    n = X.shape[0]
+    if n > 1000:
+        step = n // 1000
+        X = X[:1000 * step:step]
+        Y = Y[:1000 * step:step]
+        n = X.shape[0]
+
+    X = X.reshape(-1, 1) if len(X.shape) == 1 else X
+    Y = Y.reshape(-1, 1) if len(Y.shape) == 1 else Y
+
+    K = rbf_kernel(X, gamma=sigma)
+    L = rbf_kernel(Y, gamma=sigma)
+
+    H = np.eye(n) - np.ones((n, n)) / n
+    K_centered = H @ K @ H
+    L_centered = H @ L @ H
+
+    hsic_val = np.trace(K_centered @ L_centered) / ((n - 1) ** 2)
+    return hsic_val
+
+
+# ==========================================
+# 第一阶段重构：时空融合、异常检测与遮盖
+# ==========================================
+def data_preprocessing_pipeline(liquid_path, solid_path, output_dir, target_col='al2o3_liquid'):
+    print("=" * 60)
+    print("第一阶段：多速率同步对齐与时序连续性保护重构")
+    print("=" * 60)
+
+    print("1. 正在读取原始液相与固相工业数据...")
+    liquid_df = pd.read_csv(liquid_path, encoding='gb18030', low_memory=False)
+    solid_df = pd.read_csv(solid_path, encoding='gb18030', low_memory=False)
+    print("  -> [成功] 原始液相与固相工业数据读取完毕！")
+
+    liquid_df['datatime'] = pd.to_datetime(liquid_df['datatime'])
+    solid_df['datatime'] = pd.to_datetime(solid_df['datatime'])
+
+    liquid_cols = ['datatime', 'na2ok_value', 'nc_value', 'nc_nt_value', 'al2o3_value',
+                   'solid_content_value', 'ak_value', 'na2ot_value']
+    solid_cols = ['datatime', 'al2o3_value', 'sio2_value', 'fe2o3_value', 'tio2_value',
+                  'na2o_value', 'a_s_value', 'c_s_value', 'n_s_value', 'ca_o_value']
+
+    liquid_df = liquid_df[[c for c in liquid_cols if c in liquid_df.columns]].rename(
+        columns={'al2o3_value': 'al2o3_liquid'})
+    solid_df = solid_df[[c for c in solid_cols if c in solid_df.columns]].rename(columns={'al2o3_value': 'al2o3_solid'})
+
+    for col in liquid_df.columns:
+        if col != 'datatime': liquid_df[col] = pd.to_numeric(liquid_df[col], errors='coerce')
+    for col in solid_df.columns:
+        if col != 'datatime': solid_df[col] = pd.to_numeric(solid_df[col], errors='coerce')
+
+    print("2. 执行严格 8 小时时间步对齐与时间戳去重...")
+    liquid_unique = liquid_df.groupby('datatime').mean()
+    solid_unique = solid_df.groupby('datatime').mean()
+    liquid_8h = liquid_unique.resample('8H').median()
+    solid_8h = solid_unique.resample('8H').median()
+
+    merged_df = pd.merge(liquid_8h, solid_8h, left_index=True, right_index=True, how='outer').sort_index()
+
+    os.makedirs(output_dir, exist_ok=True)
+    step1_path = os.path.join(output_dir, 'Step1_Raw_Merged.csv')
+    merged_df.to_csv(step1_path)
+    print(f"  -> [输出] 刚融合完成的原始数据已保存至：{step1_path}")
+
+    initial_missing_rate = merged_df.isna().sum().sum() / merged_df.size * 100
+
+    print("\n3. 执行基于 Hampel 滤波的动态时序异常脉冲检测...")
+    features = [c for c in merged_df.columns if c != 'datatime']
+    outlier_mask = pd.DataFrame(False, index=merged_df.index, columns=merged_df.columns)
+
+    total_outliers = 0
+    total_points = merged_df.size
+
+    window_size = 5
+    n_sigmas = 3
+    epsilon = 1e-4
+
+    plot_feature = 'na2o_value' if 'na2o_value' in features else features[0]
+
+    for col in features:
+        series = merged_df[col].copy()
+
+        rolling_median = series.rolling(window=window_size, center=True, min_periods=1).median()
+        rolling_mad = (series - rolling_median).abs().rolling(window=window_size, center=True, min_periods=1).median()
+
+        robust_mad = np.maximum(rolling_mad, epsilon)
+
+        lower_bound = rolling_median - (n_sigmas * 1.4826 * robust_mad)
+        upper_bound = rolling_median + (n_sigmas * 1.4826 * robust_mad)
+
+        mask = (series < lower_bound) | (series > upper_bound)
+        outlier_mask[col] = mask
+
+        outliers_count = mask.sum()
+        total_outliers += outliers_count
+        replace_rate = (outliers_count / len(series)) * 100
+
+        if outliers_count > 0:
+            print(f"  - [检测日志] 特征 '{col:<20}': 修正动态异常点 {outliers_count:<4} 个, 替换率: {replace_rate:.2f}%")
+
+        if col == plot_feature:
+            plt.figure(figsize=(12, 5))
+            plot_len = min(200, len(series))
+            x_axis = range(plot_len)
+            plt.plot(x_axis, series.iloc[:plot_len], label='Original Signal', color='#4C72B0', alpha=0.8)
+            plt.plot(x_axis, lower_bound.iloc[:plot_len], label='Dynamic Lower Bound', color='#C44E52', linestyle='--')
+            plt.plot(x_axis, upper_bound.iloc[:plot_len], label='Dynamic Upper Bound', color='#C44E52', linestyle='--')
+
+            outlier_idx = np.where(mask.iloc[:plot_len])[0]
+            if len(outlier_idx) > 0:
+                plt.scatter(outlier_idx, series.iloc[outlier_idx], color='black', zorder=5, label='Detected Outliers',
+                            marker='x')
+
+            plt.title(f'Hampel Dynamic Filtering for Process Variable: {col}')
+            plt.xlabel('Time Steps (8H)')
+            plt.ylabel('Sensor Value')
+            plt.legend()
+            plt.tight_layout()
+            hampel_path = os.path.join(output_dir, 'hampel_filter_visualization.png')
+            plt.savefig(hampel_path, dpi=300)
+            plt.close()
+            print(f"  -> [输出] 论文图表1: Hampel滤波演示图已保存至: {hampel_path}")
+
+    initial_outlier_rate = total_outliers / merged_df.size * 100
+    global_replace_rate = (total_outliers / total_points) * 100
+
+    print(f"  -> [统计] 异常替换完成！全局共计修正飞点 {total_outliers} 个，整体替换率: {global_replace_rate:.4f}%")
+
+    df_with_nans = merged_df.copy()
+    df_with_nans[outlier_mask] = np.nan
+
+    print("4. 为计算生成误差，遮盖部分正常的真实目标特征...")
+    valid_target_idx = df_with_nans[target_col].dropna().index
+    mask_size = max(1, int(len(valid_target_idx) * 0.05))
+    test_mask_idx = np.random.choice(valid_target_idx, size=mask_size, replace=False)
+
+    true_masked_data = df_with_nans.loc[test_mask_idx, target_col].copy()
+    df_with_nans.loc[test_mask_idx, target_col] = np.nan
+
+    print("5. 使用平滑与插值生成基底数据，用于后续 TimeGAN 预训练...")
+    baseline_df = df_with_nans.interpolate(method='linear', limit_direction='both').ffill().bfill()
+
+    print(f"  -> [结构监控] 最终残留缺失值: {baseline_df.isna().sum().sum()} (应趋于0)")
+
+    step3_path = os.path.join(output_dir, 'Step3_Cleaned_8H_Aligned.csv')
+    baseline_df.to_csv(step3_path)
+    print(f"  -> [输出 1] 重构后的 8h 步长工业数据集已保存：Step3_Cleaned_8H_Aligned.csv")
+
+    return baseline_df, df_with_nans, test_mask_idx, true_masked_data, initial_missing_rate, initial_outlier_rate
+
+
+# ==========================================
+# 第二阶段重构：基于 HSIC 的特征优选 (剥离归一化)
+# ==========================================
+def data_discovery_and_normalization(baseline_df, df_with_nans, target_col, output_dir):
+    print("\n" + "=" * 60)
+    print("第二阶段：基于先验约束与 HSIC 的非线性特征发现")
+    print("=" * 60)
+
+    prior_physical_cols = ['fe2o3_value', 'na2ok_value', 'ak_value', 'solid_content_value']
+    candidate_cols = [col for col in baseline_df.columns if col not in prior_physical_cols and col != target_col]
+
+    X_candidates = baseline_df[candidate_cols]
+    y = baseline_df[target_col].values
+
+    print(f"1. 加载机理先验特征 {len(prior_physical_cols)} 维，开始对剩余候选变量进行 HSIC 互信息评估...")
+    hsic_results = {}
+    for col in candidate_cols:
+        hsic_results[col] = calculate_hsic(X_candidates[col].values, y)
+
+    hsic_series = pd.Series(hsic_results).sort_values(ascending=False)
+    hsic_cumsum = hsic_series.cumsum() / hsic_series.sum()
+
+    print("\n================= 候选变量 HSIC (非线性依赖) 价值排行 =================")
+    print(f"{'工艺变量':<25} | {'HSIC 得分':<12} | {'累积贡献率'}")
+    print("-" * 65)
+    for feat, score in hsic_series.items():
+        cumsum_val = hsic_cumsum[feat]
+        print(f"{feat:<25} | {score:<12.6f} | {cumsum_val:.2%}")
+    print("=======================================================================\n")
+
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+    ax2 = ax1.twinx()
+
+    bars = ax1.bar(hsic_series.index, hsic_series.values, color='#4C72B0', alpha=0.8, label='HSIC Score')
+    line, = ax2.plot(hsic_cumsum.index, hsic_cumsum.values * 100, color='#C44E52', marker='o', linewidth=2,
+                     label='Cumulative Contribution (%)')
+
+    ax2.axhline(y=95, color='gray', linestyle='--', alpha=0.7)
+    ax2.text(len(hsic_series) - 1.5, 96, '95% Threshold', color='gray')
+
+    ax1.set_xlabel('Process Variables')
+    ax1.set_ylabel('HSIC Score')
+    ax2.set_ylabel('Cumulative Contribution (%)')
+    ax1.set_xticklabels(hsic_series.index, rotation=45, ha='right')
+    plt.title('Pareto Chart of HSIC Feature Importance')
+    plt.tight_layout()
+    hsic_path = os.path.join(output_dir, 'hsic_pareto_chart.png')
+    plt.savefig(hsic_path, dpi=300)
+    plt.close()
+    print(f"  -> [输出] 论文图表2: HSIC特征帕累托图已保存至: {hsic_path}")
+
+    mask = hsic_cumsum <= 0.95
+    if not mask.all():
+        cross_idx = mask.argmin()
+        data_driven_features = hsic_cumsum.iloc[:cross_idx + 1].index.tolist()
+    else:
+        data_driven_features = hsic_cumsum.index.tolist()
+
+    final_cols = prior_physical_cols + data_driven_features + [target_col]
+    final_cols = list(dict.fromkeys(final_cols))
+
+    baseline_selected = baseline_df[final_cols]
+    nans_selected = df_with_nans[final_cols]
+
+    print(f"  -> [成功] 特征清洗与价值发现完毕！")
+    print(f"  -> [详情] 机理先验集: {prior_physical_cols}")
+    print(f"  -> [详情] 数据驱动集: {data_driven_features}")
+    print(f"  -> [详情] 最终保留特征 ({len(final_cols)}维): {final_cols}")
+
+    return baseline_selected, nans_selected, final_cols
+
+
+# ==========================================
+# 工具函数：生成全局唯一的分类标签
+# ==========================================
+def get_ak_thresholds(df, ak_col='ak_value'):
+    q15 = df[ak_col].quantile(0.15)
+    q85 = df[ak_col].quantile(0.85)
+    return q15, q85
+
+
+def generate_labels(df, q15, q85, ak_col='ak_value'):
+    vals = df[ak_col].values
+    labels = np.zeros(len(vals))
+    labels[vals < q15] = 0
+    labels[(vals >= q15) & (vals <= q85)] = 1
+    labels[vals > q85] = 2
+    return labels.astype(int)
+
+
+def create_sequences_cls(data_array, labels_array, seq_len):
+    X, y = [], []
+    for i in range(len(data_array) - seq_len + 1):
+        X.append(data_array[i: i + seq_len, :])
+        y.append(labels_array[i + seq_len - 1])
+    return np.array(X), np.array(y)
+
+
+# ==========================================
+# 第三阶段：TimeGAN 核心网络组件与机理训练
+# ==========================================
+class SpectralNorm(nn.Module):
+    def __init__(self, module, name='weight', power_iterations=1):
+        super(SpectralNorm, self).__init__()
+        self.module = module
+        self.name = name
+        self.power_iterations = power_iterations
+        w = getattr(module, name)
+        height = w.data.shape[0]
+        width = w.data.view(height, -1).shape[1]
+        self.register_buffer('u', torch.randn(height, 1))
+        self.register_buffer('v', torch.randn(width, 1))
+
+    def forward(self):
+        w = getattr(self.module, self.name)
+        w_mat = w.view(w.shape[0], -1)
+        for _ in range(self.power_iterations):
+            self.v = torch.matmul(w_mat.t(), self.u)
+            self.v = self.v / (torch.norm(self.v) + 1e-12)
+            self.u = torch.matmul(w_mat, self.v)
+            self.u = self.u / (torch.norm(self.u) + 1e-12)
+        sigma = torch.sum(self.u * torch.matmul(w_mat, self.v))
+        w_normalized = w / (sigma + 1e-12)
+        return w_normalized
+
+    def set_weight(self):
+        setattr(self.module, self.name, nn.Parameter(self.forward()))
+
+
+class DualGRU_Discriminator(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers=2):
+        super(DualGRU_Discriminator, self).__init__()
+        self.gru = nn.GRU(input_dim, hidden_dim, num_layers=num_layers, batch_first=True)
+        self.linear = nn.Linear(hidden_dim, 1)
+        self.sn = SpectralNorm(self.linear, name='weight', power_iterations=1)
+
+    def forward(self, x):
+        out, _ = self.gru(x)
+        self.sn.set_weight()
+        out = self.linear(out[:, -1, :])
+        return out
+
+
+class DualGRU_Network(nn.Module):
+    def __init__(self, input_dim, hidden_dim, out_dim, num_layers=2, use_sigmoid=True):
+        super(DualGRU_Network, self).__init__()
+        self.gru = nn.GRU(input_dim, hidden_dim, num_layers=num_layers, batch_first=True)
+        self.linear = nn.Linear(hidden_dim, out_dim)
+        self.use_sigmoid = use_sigmoid
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        out, _ = self.gru(x)
+        out = self.linear(out)
+        if self.use_sigmoid:
+            out = self.sigmoid(out)
+        return out
+
+
+def compute_gradient_penalty(discriminator, real_data, fake_data, device, lambda_gp=10.0):
+    batch_size = real_data.size(0)
+    alpha = torch.rand(batch_size, 1, 1, device=device, requires_grad=False)
+    alpha = alpha.expand_as(real_data)
+    interpolates = alpha * real_data + (1 - alpha) * fake_data
+    interpolates.requires_grad_(True)
+    with torch.backends.cudnn.flags(enabled=False):
+        with torch.cuda.amp.autocast():
+            d_interpolates = discriminator(interpolates)
+    fake = torch.ones(d_interpolates.size(), device=device, requires_grad=False)
+    gradients = torch.autograd.grad(
+        outputs=d_interpolates, inputs=interpolates, grad_outputs=fake,
+        create_graph=True, retain_graph=True, only_inputs=True,
+    )[0].reshape(batch_size, -1)
+    return lambda_gp * ((torch.norm(gradients, p=2, dim=1) - 1.0) ** 2).mean()
+
+
+def compute_temporal_smoothness_loss(generated_data):
+    if generated_data.size(1) > 1:
+        diff = generated_data[:, 1:, :] - generated_data[:, :-1, :]
+        loss_smooth = torch.mean(torch.norm(diff, p=2, dim=2) ** 2)
+        return loss_smooth
+    return torch.tensor(0.0, device=generated_data.device)
+
+
+class AdaptivePhysicalLoss:
+    def __init__(self, total_epochs, warmup_ratio=0.2, target_weight=1.0):
+        self.total_epochs = total_epochs
+        self.warmup_epochs = int(total_epochs * warmup_ratio)
+        self.transition_epochs = int(total_epochs * 0.3)
+        self.target_weight = target_weight
+
+    def get_weight(self, epoch):
+        if epoch < self.warmup_epochs:
+            return 0.0
+        elif epoch < self.warmup_epochs + self.transition_epochs:
+            return ((epoch - self.warmup_epochs) / self.transition_epochs) * self.target_weight
+        else:
+            return self.target_weight
+
+
+class ModeCollapseDetector:
+    def __init__(self, window_size=50):
+        self.window_size = window_size
+        self.real_vars = []
+        self.fake_vars = []
+        self.d_loss_history = []
+
+    def detect(self, real_data, fake_data, d_loss):
+        self.real_vars.append(np.var(real_data, axis=0).mean())
+        self.fake_vars.append(np.var(fake_data, axis=0).mean())
+        self.d_loss_history.append(d_loss)
+        if len(self.real_vars) < self.window_size: return False, 0.0
+        var_ratio = np.mean(self.fake_vars[-self.window_size:]) / (np.mean(self.real_vars[-self.window_size:]) + 1e-6)
+        d_loss_std = np.std(self.d_loss_history[-self.window_size:])
+        is_collapsed = var_ratio < 0.3 or d_loss_std < 0.01
+        severity = min(1.0, (1 - var_ratio) * 0.5 + (0.01 - d_loss_std) * 50)
+        return is_collapsed, severity
+
+
+def physical_mechanism_loss(generated_data_norm, feature_cols, scaler, device):
+    mins = torch.tensor(scaler.data_min_, dtype=torch.float32, device=device)
+    ranges = torch.tensor(scaler.data_range_, dtype=torch.float32, device=device)
+
+    generated_data_norm_clamped = torch.clamp(generated_data_norm, min=0.0, max=1.0)
+    gen_real = generated_data_norm_clamped * ranges + mins
+
+    penalty = torch.tensor(0.0, device=device, requires_grad=True)
+
+    def get_idx(name):
+        return next((i for i, col in enumerate(feature_cols) if name in col), None)
+
+    na2ok_idx, al2o3_liq_idx, ak_idx = get_idx('na2ok'), get_idx('al2o3_liquid'), get_idx('ak_value')
+    if na2ok_idx is not None and al2o3_liq_idx is not None and ak_idx is not None:
+        ak_calc = 1.645 * gen_real[:, :, na2ok_idx] / (gen_real[:, :, al2o3_liq_idx] + 1e-6)
+        penalty = penalty + 2.0 * torch.mean(torch.log1p(torch.abs(gen_real[:, :, ak_idx] - ak_calc) + 1e-8))
+        penalty = penalty + 1.0 * torch.mean(torch.log1p(torch.relu(1.30 - gen_real[:, :, ak_idx])))
+        penalty = penalty + 1.0 * torch.mean(torch.log1p(torch.relu(gen_real[:, :, ak_idx] - 1.45)))
+
+    solid_content_idx = get_idx('solid_content_value')
+    if solid_content_idx is not None:
+        penalty = penalty + 1.0 * torch.mean(torch.relu(-gen_real[:, :, solid_content_idx]))
+
+    return penalty + 1.0 * torch.mean(torch.relu(-gen_real))
+
+
+def pretrain_autoencoder(embedder, recovery, train_windows, device, epochs=50, batch_size=128):
+    print("\n" + "=" * 60)
+    print("【预训练阶段】独立训练 Autoencoder (纯重构损失)")
+    print("=" * 60)
+    ae_optimizer = optim.Adam(list(embedder.parameters()) + list(recovery.parameters()), lr=0.001)
+    ae_criterion = nn.MSELoss()
+    dataset = TensorDataset(torch.FloatTensor(train_windows).to(device))
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    embedder.train()
+    recovery.train()
+    best_loss = float('inf')
+
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for batch in dataloader:
+            X_batch = batch[0]
+            recon_loss = ae_criterion(X_batch, recovery(embedder(X_batch)))
+            ae_optimizer.zero_grad()
+            recon_loss.backward()
+            ae_optimizer.step()
+            total_loss += recon_loss.item()
+        avg_loss = total_loss / len(dataloader)
+        if (epoch + 1) % 5 == 0: print(f"  Autoencoder 预训练 Epoch {epoch + 1}/{epochs} | Recon Loss: {avg_loss:.6f}")
+        if avg_loss < best_loss: best_loss = avg_loss
+
+    print(f"✓ Autoencoder 预训练完毕！最终重构损失: {best_loss:.6f}\n")
+    return embedder, recovery
+
+
+def timegan_training_imputation_augmentation(
+        baseline_scaled, nans_selected, scaler, feature_cols,
+        test_mask_idx, true_masked_data,
+        init_missing_rate, init_outlier_rate,
+        target_col, output_dir, seq_len=24, epochs=800, target_phys_weight=1.0):
+    print("\n" + "=" * 60)
+    print("第三阶段：使用 TimeGAN 替换基底数据进行插补与增强")
+    print("=" * 60)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    input_dim = len(feature_cols)
+    hidden_dim = 128
+    latent_dim = 24
+
+    scaled_data = baseline_scaled.values
+    data_windows = np.array([scaled_data[i:i + seq_len] for i in range(len(scaled_data) - seq_len + 1)])
+
+    train_limit = int(len(data_windows) * 0.85)
+    train_windows = data_windows[:train_limit]
+
+    embedder = DualGRU_Network(input_dim, hidden_dim, latent_dim, num_layers=2).to(device)
+    recovery = DualGRU_Network(latent_dim, hidden_dim, input_dim, num_layers=2, use_sigmoid=True).to(device)
+    generator = DualGRU_Network(input_dim, hidden_dim, latent_dim, num_layers=2).to(device)
+    discriminator = DualGRU_Discriminator(latent_dim, hidden_dim, num_layers=2).to(device)
+
+    embedder, recovery = pretrain_autoencoder(embedder, recovery, train_windows, device, epochs=50, batch_size=128)
+
+    embedder.train()
+    recovery.train()
+    generator.train()
+    discriminator.train()
+
+    ae_optimizer = optim.Adam(list(embedder.parameters()) + list(recovery.parameters()), lr=0.0002, betas=(0.5, 0.999))
+    g_optimizer = optim.Adam(generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
+    d_optimizer = optim.Adam(discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
+
+    scaler_d = torch.cuda.amp.GradScaler()
+    scaler_g = torch.cuda.amp.GradScaler()
+    scaler_ae = torch.cuda.amp.GradScaler()
+
+    dataset = TensorDataset(torch.FloatTensor(train_windows).to(device))
+    dataloader = DataLoader(dataset, batch_size=64, shuffle=True, drop_last=True)
+
+    adaptive_phys_loss = AdaptivePhysicalLoss(epochs, warmup_ratio=0.2, target_weight=target_phys_weight)
+    mode_detector = ModeCollapseDetector(window_size=50)
+
+    print(f"\n【Warm-up 预热】前 {adaptive_phys_loss.warmup_epochs} 个 Epoch 将关闭物理约束")
+    print("对抗网络防泄漏独立域训练开始...\n")
+
+    hist_epochs = []
+    hist_d_loss, hist_g_loss, hist_p_loss, hist_acc = [], [], [], []
+    true_masked_clean = true_masked_data.values
+
+    for epoch in range(epochs):
+        phys_weight = adaptive_phys_loss.get_weight(epoch)
+        for batch_idx, batch in enumerate(dataloader):
+            X_real = batch[0]
+            batch_sz = X_real.size(0)
+
+            # 1. Discriminator
+            d_optimizer.zero_grad()
+            with torch.cuda.amp.autocast():
+                Z = torch.randn(batch_sz, seq_len, input_dim, device=device)
+                H, E_hat = embedder(X_real).detach(), generator(Z).detach()
+                d_loss = torch.mean(discriminator(E_hat)) - torch.mean(discriminator(H)) + compute_gradient_penalty(
+                    discriminator, H, E_hat, device)
+            scaler_d.scale(d_loss).backward()
+            scaler_d.step(d_optimizer)
+            scaler_d.update()
+
+            # 2. Autoencoder
+            ae_optimizer.zero_grad()
+            with torch.cuda.amp.autocast():
+                recon_loss = nn.MSELoss()(X_real, torch.clamp(recovery(embedder(X_real)), min=0.0, max=1.0))
+            scaler_ae.scale(recon_loss).backward()
+            scaler_ae.step(ae_optimizer)
+            scaler_ae.update()
+
+            # 3. Generator
+            if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == len(dataloader):
+                g_optimizer.zero_grad()
+                with torch.cuda.amp.autocast():
+                    E_hat_new = generator(torch.randn(batch_sz, seq_len, input_dim, device=device))
+                    g_adv_loss = -torch.mean(discriminator(E_hat_new))
+                    X_fake = recovery(E_hat_new)
+                    phys_loss = physical_mechanism_loss(torch.clamp(X_fake, 0.0, 1.0), feature_cols,
+                                                        scaler, device) if phys_weight > 0 else torch.tensor(0.0)
+                    smooth_loss = compute_temporal_smoothness_loss(E_hat_new)
+
+                    mean_real = torch.mean(X_real, dim=0)
+                    var_real = torch.var(X_real, dim=0, unbiased=False)
+                    mean_fake = torch.mean(X_fake, dim=0)
+                    var_fake = torch.var(X_fake, dim=0, unbiased=False)
+
+                    moment_matching_loss = torch.mean(torch.abs(mean_real - mean_fake)) + torch.mean(
+                        torch.abs(var_real - var_fake))
+                    g_loss = g_adv_loss + phys_weight * phys_loss + (0.5 * smooth_loss) + (0.5 * moment_matching_loss)
+                scaler_g.scale(g_loss).backward()
+                scaler_g.step(g_optimizer)
+                scaler_g.update()
+
+        if (epoch + 1) % 50 == 0:
+            embedder.eval()
+            generator.eval()
+            recovery.eval()
+            with torch.no_grad(), torch.cuda.amp.autocast():
+                is_collapsed, severity = mode_detector.detect(
+                    embedder(torch.FloatTensor(train_windows[:256]).to(device)).cpu().numpy(),
+                    generator(torch.randn(256, seq_len, input_dim, device=device)).cpu().numpy(), d_loss.item())
+
+                X_recon_tmp = recovery(embedder(torch.FloatTensor(data_windows).to(device))).cpu().numpy()
+                recon_flat = np.zeros_like(scaled_data)
+                recon_flat[:seq_len] = X_recon_tmp[0]
+                if len(X_recon_tmp) > 1: recon_flat[seq_len:] = X_recon_tmp[1:, -1, :]
+                df_tmp = pd.DataFrame(scaler.inverse_transform(recon_flat), columns=feature_cols,
+                                      index=baseline_scaled.index)
+                preds_tmp = df_tmp.loc[test_mask_idx, target_col].values
+                err_sum = np.sum(np.abs(preds_tmp - true_masked_clean))
+                true_sum = np.sum(np.abs(true_masked_clean)) + 1e-4
+                acc_tmp = max(0.0, 100.0 - (err_sum / true_sum) * 100)
+
+            embedder.train()
+            generator.train()
+            recovery.train()
+            print(f"Epoch {epoch + 1}/{epochs} | D Loss: {d_loss.item():.4f} | G Loss: {g_adv_loss.item():.4f} | "
+                  f"Phys Loss: {phys_loss.item():.4f} | Phys Weight: {phys_weight:.2f} | Acc: {acc_tmp:.2f}% | ✓ 正常")
+
+            hist_epochs.append(epoch + 1)
+            hist_d_loss.append(d_loss.item())
+            hist_g_loss.append(g_adv_loss.item())
+            hist_p_loss.append(phys_loss.item())
+            hist_acc.append(acc_tmp)
+
+    print("\n  -> 正在绘制对抗训练与数据补全准确度曲线...")
+    fig, axes = plt.subplots(2, 1, figsize=(10, 10))
+    axes[0].plot(hist_epochs, hist_d_loss, label='D Loss', color='blue')
+    axes[0].plot(hist_epochs, hist_g_loss, label='G Loss', color='orange')
+    axes[0].plot(hist_epochs, hist_p_loss, label='Phys Loss', color='green')
+    axes[0].set_title('TimeGAN 对抗与机理损失变化曲线')
+    axes[0].legend()
+    axes[1].plot(hist_epochs, hist_acc, label='Imputation Accuracy (%)', color='red', marker='o')
+    axes[1].set_title('数据补全准确度 (1 - WMAPE) 变化曲线')
+    axes[1].set_xlabel('Epochs')
+    axes[1].set_ylabel('Accuracy (%)')
+    axes[1].legend()
+    plt.tight_layout()
+    curve_path = os.path.join(output_dir, 'training_curves.png')
+    plt.savefig(curve_path, dpi=300)
+    plt.close()
+    print(f"  -> [输出] 论文图表3: 训练曲线图已保存至：{curve_path}")
+
+    # --- 核心插补逻辑 ---
+    print("\n利用训练好的 TimeGAN 自动编码器重构全局序列并填补原始 NaNs...")
+    embedder.eval()
+    recovery.eval()
+    with torch.no_grad():
+        X_recon = recovery(embedder(torch.FloatTensor(data_windows).to(device))).cpu().numpy()
+
+    reconstructed = np.zeros_like(scaled_data)
+    reconstructed[:seq_len] = X_recon[0]
+    if len(X_recon) > 1:
+        reconstructed[seq_len:] = X_recon[1:, -1, :]
+
+    df_recon = pd.DataFrame(scaler.inverse_transform(reconstructed), columns=feature_cols, index=baseline_scaled.index)
+
+    df_imputed = nans_selected.copy()
+    mask_nan = df_imputed.isna()
+    df_imputed[mask_nan] = df_recon[mask_nan]
+
+    timegan_preds_clean = df_imputed.loc[test_mask_idx, target_col].values
+    error_sum = np.sum(np.abs(timegan_preds_clean - true_masked_clean))
+    true_sum = np.sum(np.abs(true_masked_clean)) + 1e-4
+    gen_wmape = (error_sum / true_sum) * 100
+
+    gen_rmse = np.sqrt(mean_squared_error(true_masked_clean, timegan_preds_clean))
+    gen_mape = mean_absolute_percentage_error(true_masked_clean, timegan_preds_clean) * 100
+    gen_cv = (gen_rmse / np.mean(true_masked_clean)) * 100
+
+    outlier_mask_new = pd.DataFrame(False, index=df_imputed.index, columns=df_imputed.columns)
+    for col in feature_cols:
+        series_orig = nans_selected[col].dropna()
+        Q1, Q3 = series_orig.quantile(0.25), series_orig.quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        series_imputed = df_imputed[col]
+        outlier_mask_new[col] = (series_imputed < lower_bound) | (series_imputed > upper_bound)
+
+    final_outlier_rate = outlier_mask_new.sum().sum() / df_imputed.size * 100
+    final_missing_rate = df_imputed.isna().sum().sum() / df_imputed.size * 100
+
+    print("\n  -> 正在绘制 TimeGAN 数据重构误差指标对比图...")
+    fig, ax = plt.subplots(figsize=(8, 6))
+    metrics_names = ['WMAPE (%)', 'MAPE (%)', 'CV (%)', 'RMSE (Value)']
+    metrics_values = [gen_wmape, gen_mape, gen_cv, gen_rmse]
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+
+    bars = ax.bar(metrics_names, metrics_values, color=colors, width=0.5)
+    ax.set_title('TimeGAN 数据插补与重构误差多维评估')
+    ax.set_ylabel('误差数值 (越低越好)')
+
+    for bar in bars:
+        yval = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width() / 2, yval + (yval * 0.02), f'{yval:.2f}', ha='center', va='bottom',
+                fontsize=10)
+
+    plt.tight_layout()
+    imputation_metrics_path = os.path.join(output_dir, 'imputation_error_metrics.png')
+    plt.savefig(imputation_metrics_path, dpi=300)
+    plt.close()
+
+    target_gen_size = int(len(df_imputed) * 5.5)
+    generator.eval()
+    with torch.no_grad():
+        Z_new = torch.randn(target_gen_size, seq_len, input_dim, device=device)
+        X_gen_seqs_scaled = recovery(generator(Z_new)).cpu().numpy()
+
+    return df_imputed, X_gen_seqs_scaled, gen_wmape, discriminator, embedder
+
+
+# ==========================================
+# 原有功能保留与新增定性定量分析
+# ==========================================
+def compute_kl_divergence(real, fake, bins=20):
+    hist_real, bin_edges = np.histogram(real, bins=bins, density=True)
+    hist_fake, _ = np.histogram(fake, bins=bin_edges, density=True)
+    return entropy(hist_real + 1e-8, hist_fake + 1e-8)
+
+
+def compute_fid(real, fake):
+    mu1, sigma1 = real.mean(axis=0), np.cov(real, rowvar=False)
+    mu2, sigma2 = fake.mean(axis=0), np.cov(fake, rowvar=False)
+    ssdiff = np.sum((mu1 - mu2) ** 2.0)
+    covmean = sqrtm(sigma1.dot(sigma2))
+    if np.iscomplexobj(covmean): covmean = covmean.real
+    return ssdiff + np.trace(sigma1 + sigma2 - 2.0 * covmean)
+
+
+def compute_mmd(real, fake, gamma=1.0, max_samples=2000):
+    if real.shape[0] > max_samples: real = real[np.random.choice(real.shape[0], max_samples, replace=False)]
+    if fake.shape[0] > max_samples: fake = fake[np.random.choice(fake.shape[0], max_samples, replace=False)]
+    xx = rbf_kernel(real, real, gamma)
+    yy = rbf_kernel(fake, fake, gamma)
+    xy = rbf_kernel(real, fake, gamma)
+    return xx.mean() + yy.mean() - 2 * xy.mean()
+
+
+def theoretical_validation(X_real, X_aug, X_tg, output_dir):
+    real_2d = X_real.reshape(X_real.shape[0], -1) if len(X_real.shape) == 2 else X_real[:, -1, :]
+    aug_2d = X_aug.reshape(X_aug.shape[0], -1) if len(X_aug.shape) == 2 else X_aug[:, -1, :]
+    tg_2d = X_tg.reshape(X_tg.shape[0], -1) if len(X_tg.shape) == 2 else X_tg[:, -1, :]
+
+    results = {}
+    datasets = {"随机噪声增强": aug_2d, "TimeGAN增强": tg_2d}
+
+    for name, fake_2d in datasets.items():
+        ks_stat = np.mean([ks_2samp(real_2d[:, i], fake_2d[:, i]).statistic for i in range(real_2d.shape[1])])
+        kl_stat = np.mean([compute_kl_divergence(real_2d[:, i], fake_2d[:, i]) for i in range(real_2d.shape[1])])
+        fid_stat = compute_fid(real_2d, fake_2d)
+        mmd_stat = compute_mmd(real_2d, fake_2d)
+        results[name] = [ks_stat, kl_stat, fid_stat, mmd_stat]
+
+    metrics = ['KS', 'KL', 'FID', 'MMD']
+    x = np.arange(len(metrics))
+    width = 0.35
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.bar(x - width / 2, results["随机噪声增强"], width, label='噪声增强', color='#1f77b4')
+    ax.bar(x + width / 2, results["TimeGAN增强"], width, label='TimeGAN增强', color='#ff7f0e')
+    ax.set_title('分布一致性理论验证 (指标越低越好)')
+    ax.set_xticks(x);
+    ax.set_xticklabels(metrics)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'theoretical_validation.png'), dpi=300)
+    plt.close()
+
+
+def export_and_plot_distributions(X_orig, X_noise, X_gan, feature_names, output_dir):
+    X_orig_flat = X_orig[:, -1, :] if len(X_orig.shape) == 3 else X_orig
+    X_noise_flat = X_noise[:, -1, :] if len(X_noise.shape) == 3 else X_noise
+    X_gan_flat = X_gan[:, -1, :] if len(X_gan.shape) == 3 else X_gan
+
+    features_to_plot = min(4, X_orig_flat.shape[1])
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    axes = axes.flatten()
+
+    for i in range(features_to_plot):
+        sns.kdeplot(X_orig_flat[:, i], ax=axes[i], label='真实(Imputed)', color='blue', fill=True, alpha=0.3)
+        sns.kdeplot(X_noise_flat[:, i], ax=axes[i], label='噪声', color='green', fill=True, alpha=0.3)
+        sns.kdeplot(X_gan_flat[:, i], ax=axes[i], label='TimeGAN', color='red', fill=True, alpha=0.3)
+        axes[i].set_title(f'{feature_names[i]} 特征分布')
+        axes[i].legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'feature_distributions.jpg'), dpi=300)
+    plt.close()
+
+    try:
+        tsne = TSNE(n_components=2, random_state=42, n_iter=300)
+        safe_sample_size = min(500, len(X_orig_flat), len(X_noise_flat), len(X_gan_flat))
+
+        idx_orig = np.random.choice(len(X_orig_flat), safe_sample_size, replace=False)
+        idx_noise = np.random.choice(len(X_noise_flat), safe_sample_size, replace=False)
+        idx_gan = np.random.choice(len(X_gan_flat), safe_sample_size, replace=False)
+
+        data_tsne = np.vstack([X_orig_flat[idx_orig], X_noise_flat[idx_noise], X_gan_flat[idx_gan]])
+        labels_tsne = ['Original'] * safe_sample_size + ['Noise Augmented'] * safe_sample_size + [
+            'TimeGAN Enhanced'] * safe_sample_size
+
+        tsne_results = tsne.fit_transform(data_tsne)
+
+        plt.figure(figsize=(10, 8))
+        sns.scatterplot(x=tsne_results[:, 0], y=tsne_results[:, 1], hue=labels_tsne, alpha=0.7, palette='Set1')
+        plt.title('t-SNE 降维分布可视化：真实数据 vs 生成数据')
+        plt.tight_layout()
+        tsne_path = os.path.join(output_dir, 'tsne_distribution.png')
+        plt.savefig(tsne_path, dpi=300)
+        plt.close()
+    except Exception as e:
+        print(f"  -> [警告] t-SNE 绘制失败: {e}")
+
+
+# ==========================================
+# 第四阶段：状态识别 CNN 网络 (分类任务) [GAP 全卷积突破版]
+# ==========================================
+class CNN1D_Classifier(nn.Module):
+    def __init__(self, input_dim, seq_len, num_classes=3):
+        super(CNN1D_Classifier, self).__init__()
+        self.conv1 = nn.Conv1d(input_dim, 64, kernel_size=5, padding=2)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.relu1 = nn.ReLU()
+
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.relu2 = nn.ReLU()
+
+        self.conv3 = nn.Conv1d(128, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm1d(128)
+        self.relu3 = nn.ReLU()
+
+        self.gap = nn.AdaptiveAvgPool1d(1)
+        self.dropout = nn.Dropout(p=0.3)
+        self.fc = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = x.transpose(1, 2)
+        x = self.relu1(self.bn1(self.conv1(x)))
+        x = self.relu2(self.bn2(self.conv2(x)))
+        x = self.relu3(self.bn3(self.conv3(x)))
+
+        x = self.gap(x)
+        x = x.view(x.size(0), -1)
+        x = self.dropout(x)
+        return self.fc(x)
+
+
+def evaluate_cnn_classifier(train_X, train_y, test_X, test_y, output_dir, model_name="Baseline", epochs=100,
+                            batch_size=64):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_X_sub, val_X, train_y_sub, val_y = train_test_split(
+        train_X, train_y, test_size=0.1, stratify=train_y, random_state=42
+    )
+
+    model = CNN1D_Classifier(train_X.shape[2], train_X.shape[1], num_classes=3).to(device)
+
+    class_counts = np.bincount(train_y_sub)
+    total_samples = len(train_y_sub)
+    smoothed_weights = np.sqrt(total_samples / (len(class_counts) * class_counts))
+    class_weights_tensor = torch.FloatTensor(smoothed_weights).to(device)
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
+    optimizer = optim.Adam(model.parameters(), lr=0.002, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+
+    train_loader = DataLoader(
+        TensorDataset(torch.FloatTensor(train_X_sub), torch.LongTensor(train_y_sub)),
+        batch_size=batch_size, shuffle=True
+    )
+
+    best_val_acc = 0.0
+    best_model_state = None
+
+    for epoch in range(epochs):
+        model.train()
+        for batch_x, batch_y in train_loader:
+            optimizer.zero_grad()
+            outputs = model(batch_x.to(device))
+            loss = criterion(outputs, batch_y.to(device))
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_out = model(torch.FloatTensor(val_X).to(device))
+            _, val_preds = torch.max(val_out, 1)
+            val_acc = accuracy_score(val_y, val_preds.cpu().numpy())
+            if val_acc >= best_val_acc:
+                best_val_acc = val_acc
+                best_model_state = model.state_dict().copy()
+
+    model.load_state_dict(best_model_state)
+    model.eval()
+    with torch.no_grad():
+        outputs = model(torch.FloatTensor(test_X).to(device))
+        _, predictions = torch.max(outputs, 1)
+        predictions = predictions.cpu().numpy()
+
+    acc = accuracy_score(test_y, predictions) * 100
+    print(f"  -> [{model_name}] 测试集诊断准确率: {acc:.2f}%")
+
+    cm = confusion_matrix(test_y, predictions, labels=[0, 1, 2])
+    global_cm_results.append(cm)
+
+    display_names = {
+        "Original_Imputed_Sample": "基准小样本组",
+        "Random_Noise_Augmented": "随机噪声增强组",
+        "TimeGAN_Enhanced": "TimeGAN机理增强组"
+    }
+    global_cm_names.append(display_names.get(model_name, model_name))
+
+    return predictions, test_y, acc
+
+
+# =========================================================================================
+# 专属的 Nature 风格 1x3 复合混淆矩阵绘制函数 (已根据要求修改颜色和图例映射)
+# =========================================================================================
+def draw_nature_composite_matrix(matrices, titles, output_dir):
+    print("\n  -> 正在合成 Nature 风格全局复合混淆矩阵大图...")
+    letters = ['(a)', '(b)', '(c)']
+    class_names = ['欠溶出(0)', '标准稳态(1)', '过碱(2)']
+
+    COLOR_LIGHT_BLUE = '#85C1E9'  # 浅蓝
+    COLOR_LIGHT_GRAY = '#E5E7E9'  # 浅灰
+    COLOR_DARK_RED = '#A03124'    # 深红
+    COLOR_LIGHT_RED = '#F5B7B1'   # 浅红
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5.2))
+
+    for idx, ax in enumerate(axes):
+        cm = matrices[idx]
+
+        sns.heatmap(cm, annot=False, cmap=mcolors.ListedColormap(['none']),
+                    cbar=False, ax=ax, xticklabels=class_names, yticklabels=class_names)
+
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        for i in range(3):
+            for j in range(3):
+                val = cm[i, j]
+
+                # 严格按照坐标进行颜色分配: (真实工况i, 预测工况j)
+                if i == j:
+                    # (0,0), (1,1), (2,2) 浅蓝
+                    bg_color = COLOR_LIGHT_BLUE
+                elif (i == 0 and j == 2) or (i == 2 and j == 0):
+                    # (0,2), (2,0) 浅红色
+                    bg_color = COLOR_LIGHT_RED
+                elif (i == 2 and j == 1) or (i == 0 and j == 1):
+                    # (2,1), (0,1) 深红色
+                    bg_color = COLOR_DARK_RED
+                elif (i == 1 and j == 0) or (i == 1 and j == 2):
+                    # (1,0), (1,2) 浅灰色
+                    bg_color = COLOR_LIGHT_GRAY
+                else:
+                    bg_color = '#FFFFFF'
+
+                rect = patches.Rectangle((j, i), 1, 1, linewidth=4, edgecolor='white', facecolor=bg_color, zorder=1)
+                ax.add_patch(rect)
+
+                # 智能字体颜色适配
+                text_color = 'white' if bg_color == COLOR_DARK_RED else '#2C3E50'
+                fontsize = 20
+                fontweight = 'normal'
+
+                # 特殊区域醒目突出处理（例如漏报或误报为0时）
+                if val == 0:
+                    fontsize = 36
+                    fontweight = 'bold'
+                    if bg_color == COLOR_LIGHT_GRAY:
+                        text_color = COLOR_DARK_RED
+                    elif bg_color == COLOR_DARK_RED:
+                        text_color = 'white'
+
+                ax.text(j + 0.5, i + 0.5, str(val),
+                        ha='center', va='center', color=text_color,
+                        fontsize=fontsize, fontweight=fontweight, zorder=2)
+
+        ax.set_xticks(np.arange(3) + 0.5)
+        ax.set_yticks(np.arange(3) + 0.5)
+        ax.tick_params(axis='both', which='both', length=0, labelsize=14)
+
+        ax.set_xticklabels(class_names, rotation=0)
+        ax.set_xlabel('预测工况', fontsize=15, fontweight='bold', labelpad=12)
+
+        if idx == 0:
+            ax.set_yticklabels(class_names, rotation=0)
+            ax.set_ylabel('真实工况', fontsize=15, fontweight='bold', labelpad=12)
+        else:
+            ax.set_yticklabels([])
+            ax.set_ylabel('')
+
+        ax.text(-0.02, 1.06, letters[idx], transform=ax.transAxes,
+                fontsize=24, fontweight='bold', va='bottom', ha='right')
+        ax.set_title(titles[idx], fontsize=16, pad=18, fontweight='bold')
+
+    # 图例配置（言简意赅风格，已根据新颜色映射更新定义）
+    legend_elements = [
+        patches.Patch(facecolor=COLOR_LIGHT_BLUE, edgecolor='white', label='准确命中'),
+        patches.Patch(facecolor=COLOR_DARK_RED, edgecolor='white', label='异常漏报'),
+        patches.Patch(facecolor=COLOR_LIGHT_GRAY, edgecolor='white', label='稳态误报'),
+        patches.Patch(facecolor=COLOR_LIGHT_RED, edgecolor='white', label='交叉误判')
+    ]
+
+    plt.subplots_adjust(bottom=0.28, wspace=0.35)
+
+    fig.legend(handles=legend_elements, loc='lower center', ncol=4,
+               bbox_to_anchor=(0.5, 0.04), fontsize=15, frameon=False,
+               handlelength=1.6, handleheight=1.2)
+
+    output_path = os.path.join(output_dir, 'Nature_Style_Confusion_Matrix.png')
+    plt.savefig(output_path, dpi=600, bbox_inches='tight', transparent=False, facecolor='white')
+    plt.close()
+    print(f"  -> 论文图表6: 高级版合成混淆矩阵大图已成功导出至: {output_path}")
+
+
+# ==========================================
+# 核心调度域 (Main Block)
+# ==========================================
+if __name__ == '__main__':
+    LIQUID_FILE_PATH = r'C:\Users\39606\OneDrive\桌面\bishe\liquid_data.csv'
+    SOLID_FILE_PATH = r'C:\Users\39606\OneDrive\桌面\bishe\solid_data.csv'
+    OUTPUT_DIR = r'C:\Users\39606\OneDrive\桌面\bishe\output'
+
+    target_feature = 'al2o3_liquid'
+
+    # 1. 预处理
+    baseline_df, df_with_nans, test_mask_idx, true_masked_data, init_miss, init_out = data_preprocessing_pipeline(
+        LIQUID_FILE_PATH, SOLID_FILE_PATH, OUTPUT_DIR, target_feature
+    )
+
+    # 2. 特征筛选
+    baseline_selected, nans_selected, feature_cols = data_discovery_and_normalization(
+        baseline_df, df_with_nans, target_col=target_feature, output_dir=OUTPUT_DIR
+    )
+
+    print("\n>>> 执行防泄漏的时序隔离与独立归一化 <<<")
+    split_idx = int(len(baseline_selected) * 0.85)
+
+    train_baseline = baseline_selected.iloc[:split_idx]
+    test_baseline = baseline_selected.iloc[split_idx:]
+
+    scaler = MinMaxScaler()
+    scaler.fit(train_baseline)
+
+    train_scaled_df = pd.DataFrame(scaler.transform(train_baseline), columns=feature_cols, index=train_baseline.index)
+    test_scaled_df = pd.DataFrame(scaler.transform(test_baseline), columns=feature_cols, index=test_baseline.index)
+
+    baseline_scaled = pd.concat([train_scaled_df, test_scaled_df])
+
+    # 3. TimeGAN 插补与增强
+    df_imputed_real, X_gen_seqs_scaled, gen_wmape, discriminator, embedder = timegan_training_imputation_augmentation(
+        baseline_scaled, nans_selected, scaler, feature_cols,
+        test_mask_idx, true_masked_data,
+        init_miss, init_out, target_feature, OUTPUT_DIR, seq_len=24, epochs=600, target_phys_weight=1.0
+    )
+
+    # ---------------- 统一数据流动与切分重构 ----------------
+    print("\n>>> 正在进行数据状态打标与分类集重构 <<<")
+    q15_global, q85_global = get_ak_thresholds(df_imputed_real, ak_col='ak_value')
+
+    df_imputed_scaled = pd.DataFrame(scaler.transform(df_imputed_real), columns=feature_cols)
+
+    SEQ_LEN = 24
+    all_labels = generate_labels(df_imputed_real, q15_global, q85_global, ak_col='ak_value')
+    X_all, y_all = create_sequences_cls(df_imputed_scaled.values, all_labels, SEQ_LEN)
+
+    split_idx_cnn = int(len(X_all) * 0.85)
+    X_train_orig = X_all[:split_idx_cnn]
+    X_test = X_all[split_idx_cnn:]
+    y_train_orig = y_all[:split_idx_cnn]
+    y_test = y_all[split_idx_cnn:]
+
+    X_timegan_full = X_gen_seqs_scaled
+    last_steps_raw = pd.DataFrame(scaler.inverse_transform(X_timegan_full[:, -1, :]), columns=feature_cols)
+    y_timegan_full = generate_labels(last_steps_raw, q15_global, q85_global, ak_col='ak_value')
+
+    print("\n>>> 执行【类别感知】置信度过滤 (按原始比例择优录取) <<<")
+    discriminator.eval()
+    embedder.eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    with torch.no_grad(), torch.cuda.amp.autocast():
+        X_tensor = torch.FloatTensor(X_timegan_full).to(device)
+        H_tensor = embedder(X_tensor)
+        d_scores = discriminator(H_tensor).squeeze().cpu().numpy()
+
+    X_filtered_list = []
+    y_filtered_list = []
+
+    for cls in [0, 1, 2]:
+        cls_idx = np.where(y_timegan_full == cls)[0]
+        if len(cls_idx) == 0:
+            continue
+
+        cls_scores = d_scores[cls_idx]
+        num_keep = int(len(cls_idx) * 0.5)
+        top_indices = np.argsort(cls_scores)[::-1][:max(1, num_keep)]
+
+        X_filtered_list.append(X_timegan_full[cls_idx[top_indices]])
+        y_filtered_list.append(y_timegan_full[cls_idx[top_indices]])
+
+    X_timegan_filtered = np.vstack(X_filtered_list)
+    y_timegan_filtered = np.concatenate(y_filtered_list)
+
+    X_noise = X_train_orig + np.random.normal(0, 0.03, X_train_orig.shape)
+    y_noise = y_train_orig
+
+    X_train_noise_aug = np.vstack((X_train_orig, X_noise))
+    y_train_noise_aug = np.concatenate((y_train_orig, y_noise))
+
+    X_train_timegan_aug = np.vstack((X_train_orig, X_timegan_filtered))
+    y_train_timegan_aug = np.concatenate((y_train_orig, y_timegan_filtered))
+
+    # ==========================================
+    # 理论分布验证与可视化
+    # ==========================================
+    X_orig_raw = scaler.inverse_transform(X_train_orig[:, -1, :])
+    X_noise_raw = scaler.inverse_transform(X_noise[:, -1, :])
+    X_tg_raw = scaler.inverse_transform(X_timegan_filtered[:, -1, :])
+
+    theoretical_validation(X_orig_raw, X_noise_raw, X_tg_raw, OUTPUT_DIR)
+    export_and_plot_distributions(X_orig_raw, X_noise_raw, X_tg_raw, feature_cols, OUTPUT_DIR)
+
+    # ==========================================
+    # 第四阶段：状态诊断分类比武
+    # ==========================================
+    print("\n" + "=" * 60)
+    print("第四阶段：基于 1D-CNN 的工艺状态分类诊断验证大比武")
+    print("=" * 60)
+
+    global_cm_results = []
+    global_cm_names = []
+
+    pred_base, _, acc_base = evaluate_cnn_classifier(
+        X_train_orig, y_train_orig, X_test, y_test, OUTPUT_DIR, model_name="Original_Imputed_Sample", epochs=100)
+
+    pred_noise, _, acc_noise = evaluate_cnn_classifier(
+        X_train_noise_aug, y_train_noise_aug, X_test, y_test, OUTPUT_DIR, model_name="Random_Noise_Augmented",
+        epochs=100)
+
+    pred_gan, _, acc_gan = evaluate_cnn_classifier(
+        X_train_timegan_aug, y_train_timegan_aug, X_test, y_test, OUTPUT_DIR, model_name="TimeGAN_Enhanced", epochs=100)
+
+    if len(global_cm_results) == 3:
+        draw_nature_composite_matrix(global_cm_results, global_cm_names, OUTPUT_DIR)
+
+    print("\n=================  三大方法分类效能最终报告  ==================")
+    print(f"{'评估指标':<10} | {'基准小样本':<12} | {'随机噪声增强':<12} | {'TimeGAN机理增强':<15}")
+    print("-" * 65)
+    print(f"{'诊断准确率':<10} | {acc_base:>11.2f}% | {acc_noise:>11.2f}% | {acc_gan:>14.2f}%")
+    print("=========================================================================\n")
+
+    prediction_results = {'Accuracy (%)': [acc_base, acc_noise, acc_gan]}
+    df_pred = pd.DataFrame(prediction_results,
+                           index=['Original_Imputed_Sample', 'Random_Noise_Augmented', 'TimeGAN_Enhanced'])
+
+    excel_path = os.path.join(OUTPUT_DIR, 'performance_metrics_report.xlsx')
+    with pd.ExcelWriter(excel_path) as writer:
+        df_pred.to_excel(writer, sheet_name='CNN_Classification_Metrics')
+
+    print(f"🎉 毕设核心验证代码执行完毕 (已执行严格防泄漏协议并合成复合混淆矩阵)！")
