@@ -11,6 +11,6 @@
 如要验算，可联系u202240660@xs.ustb.edu.cn讨论
 ## 📁 仓库目录结构
 ```text
-├── code                     # 核心代码目录
-├── requirements.txt        # 项目依赖库清单
+├── code                    # 核心代码目录
+├── Packages_Environment    # 项目依赖库清单
 └── README.md               # 项目说明文档
